@@ -18,6 +18,15 @@ rates = []
 
 
 
+def _time_log(f):
+    def wrap(*args, **kwargs):
+        tb = time.time()
+        ret = f(*args, **kwargs)
+        print("elapsed: {}".format(time.time() - tb))
+        return ret
+    return wrap
+
+@_time_log
 def parseXML(data):
 
     xml = etree.fromstring(data.encode("utf-8"))
@@ -37,7 +46,7 @@ def parseRE(data):
 def get_rates(rates):
 
     while True:
-        res = requests.get("http://rates.fxcm.com/RatesXML2", timeout=0.5)
+        res = requests.get("http://rates.fxcm.com/RatesXML2", timeout=0.05)
         time.sleep(1)
         rates.append(parseXML(res.text))
 
