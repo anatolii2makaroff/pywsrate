@@ -8,6 +8,7 @@
 import asyncio
 import websockets
 from threading import Thread
+from queue import Queue
 import requests
 import time
 from lxml import etree
@@ -30,11 +31,9 @@ FX_URL = "http://rates.fxcm.com/RatesXML2"
 
 ######
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG,
+                    format="%(asctime)s %(threadName)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
-
-rates = []
 
 
 def _time_log(f):
@@ -72,42 +71,68 @@ def parseRE(data):
     pass
 
 
-
 def b_time():
     """ begin date memorizer with skip"""
     tb = time.time()
     while True:
-        i = (yield)
-
-        if i:
+        skip = yield
+        if skip:
             tb = time.time()
 
         yield tb
 
 
-@_time_log
-def get_rates(rates):
-
-    s = requests.Session()
-
-    # tb = b_time()
-    # tb.send(None)
+def rates_saver(queue):
 
     while True:
-        tb = time.time()
+        data = queue.get()
+        logger.debug("get data: {0}".format(data))
+
+
+
+
+def rates_producer(rates, queue):
+
+    s = requests.Session()
+    _flag = True
+
+    tbg = b_time()
+    tbg.send(None)
+
+    while True:
+        tb = tbg.send(_flag)
+        logger.debug("begin time is {}".format(tb))
         try:
-            res = s.get(FX_URL, timeout=0.05)
+            res = s.get(FX_URL, timeout=0.3)
             if res.status_code != 200:
                 raise Exception(res.text)
 
             # perse result and put to cache
-            rates.append(parseXML(res.text))
+            rate = parseXML(res.text)
+
+            rates.append(rate)
+
+            if not queue.full():
+                logger.debug("queue size is {0}".format(queue.qsize()))
+                queue.put_nowait(rate)
+
+            next(tbg)
+            _flag = True
 
         except Exception as e:
             logger.error(e)
-            # try immedeatly 50 ms
-            time.sleep(0.050)
+            # try immedeatly 150 ms
+            # TODO: increasing interval value (if FX is not avaliable too long)
+            time.sleep(0.150)
             logger.debug("try to reconnect..")
+
+            #
+            # if we'll make more trying - need save first time
+            # after we'll sleep less time
+            #
+            next(tbg)
+            _flag = False
+
             continue
 
         _sleep1(time.time() - tb)
@@ -143,13 +168,31 @@ async def h_rate(websocket, path):
 
 def main():
 
-    #
-    # start lister for rates
-    # it pull, write & save to redis rates
-    #
-    t = Thread(target=get_rates, args=(rates,))
-    t.start()
+    rates = []
+    queue = Queue(600)  # 10 min capacity
 
+    #
+    # start producer for rates
+    # it pull, write & publish
+    #
+    t = Thread(target=rates_producer, args=(rates, queue))
+
+    #
+    # start consumer for rates
+    # save rates to any store (last 30 min)
+    #
+    # if store is not avaliable put rates in memory queue
+    # for later flush
+    #
+    t2 = Thread(target=rates_saver, args=(queue,))
+
+    t.start()
+    t2.start()
+
+    #
+    # start event loop for websocket requests
+    # rates comes from publisher
+    #
 
     start_server = websockets.serve(h_rate, HOST, PORT)
     asyncio.get_event_loop().run_until_complete(start_server)
