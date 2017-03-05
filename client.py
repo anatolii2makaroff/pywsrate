@@ -2,15 +2,17 @@
 import asyncio
 import websockets
 
-async def hello():
-    async with websockets.connect('ws://localhost:8765') as websocket:
-        name = input("What's your name? ")
-        await websocket.send(name)
-        print("> {}".format(name))
+async def test():
+    async with websockets.connect('ws://localhost:8080') as websocket:
+        while True:
+            cmd = input("What's cmd?")
+            if cmd == "assets":
+                await websocket.send({"action":"assets",
+                                      "message":{}})
 
-        greeting = await websocket.recv()
-        print("< {}".format(greeting))
+            data = await websocket.recv()
+            print("< {}".format(data))
 
 if __name__ == "__main__":
 
-    asyncio.get_event_loop().run_until_complete(hello())
+    asyncio.get_event_loop().run_until_complete(test())

@@ -9,6 +9,7 @@ import asyncio
 import websockets
 from threading import Thread
 from queue import Queue
+from collections import deque
 import requests
 import time
 from lxml import etree
@@ -21,7 +22,10 @@ import logging
 
 R_LIST = {
     1: "EURUSD",
-    2: "USDJPY"
+    2: "USDJPY",
+    3: "GBPUSD",
+    4: "AUDUSD",
+    5: "USDCAD"
 }
 
 HOST = "localhost"
@@ -31,13 +35,42 @@ FX_URL = "http://rates.fxcm.com/RatesXML2"
 
 ######
 
-logging.basicConfig(level=logging.DEBUG,
+logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(threadName)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
+class Rate(object):
+    """
+        Rate values struct
+        and L1 cache (default 300)
+    """
+    def __init__(self, cached_size=300):
+        self.data = {}
+        self._cache = deque([], cached_size)
+
+    def update(self, timestamp, data):
+        for i in data.items():
+            self.data[i[0]] = {"assetName": i[0],
+                               "time": timestamp,
+                               "assetId": [x[0] for x in R_LIST.items()
+                                            if x[1] == i[0]][0],
+                                "value": i[1]}
+
+        # add to cache
+        self._cache.append(self.data)
+
+
+    def current(self):
+        return self.data
+
+    def get_cache(self):
+        return self._cache
+
+
 def _time_log(f):
     """
+    util
     time measure decorator
     """
     def wrap(*args, **kwargs):
@@ -83,10 +116,16 @@ def b_time():
 
 
 def rates_saver(queue):
+    """
+        data save consumer
+
+    """
 
     while True:
         data = queue.get()
         logger.debug("get data: {0}".format(data))
+
+        # TODO save to redis..
 
 
 
@@ -110,21 +149,23 @@ def rates_producer(rates, queue):
             # perse result and put to cache
             rate = parseXML(res.text)
 
-            rates.append(rate)
+            rates.update(tb, rate)
+            logger.debug("rate's data: {0}".format(rates.current()))
 
             if not queue.full():
                 logger.debug("queue size is {0}".format(queue.qsize()))
-                queue.put_nowait(rate)
+                queue.put_nowait(rates.current())
 
             next(tbg)
             _flag = True
 
         except Exception as e:
+            # TODO: need catch only FX service err..
             logger.error(e)
             # try immedeatly 150 ms
             # TODO: increasing interval value (if FX is not avaliable too long)
             time.sleep(0.150)
-            logger.debug("try to reconnect..")
+            logger.info("try to reconnect..")
 
             #
             # if we'll make more trying - need save first time
@@ -150,25 +191,38 @@ def _sleep1(delta):
         time.sleep(1.0 - delta)
 
 
-
 async def h_rate(websocket, path):
-    name = await websocket.recv()
-    print("< {}".format(name))
-
-    greeting = "Hello {}!".format(name)
-    await websocket.send(greeting)
-
+    """
+    Handler for ws connections
+    """
     while True:
-        import pdb; pdb.set_trace()  # XXX BREAKPOINT
+
+        data = await websocket.recv()
+        logger.debug("recv {}".format(data))
+
+        cmd = data.get("action")
+        logger.debug("cmd is {}".format(cmd))
+
+        if cmd == "assets":
+            pass
+        elif cmd == "subscribe":
+            while True:
+
+                await asyncio.sleep(1.0)
 
 
-        await websocket.send(rates[:-1])
-        await asyncio.sleep(1.0)
+        else:
+            logger.warn("unknow cmd: {}".format(cmd))
+            await websocket.send("unknow cmd: {}".format(cmd))
 
 
 def main():
 
-    rates = []
+    #
+    # TODO when starts -> fill rates from store
+    #
+    rates = Rate()
+
     queue = Queue(600)  # 10 min capacity
 
     #
