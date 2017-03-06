@@ -2,7 +2,7 @@
 # Test ex. Websocket Rate Server
 #
 # Authtor Makarov A
-# Date    04/03/17
+# Date    06/03/17
 #
 
 import asyncio
@@ -66,6 +66,7 @@ class Rate(object):
     def __init__(self, cached_size=300):
         self.data = {}
         self._cache = deque([], cached_size)
+
     @_time_log
     def update(self, timestamp, data):
         for i in data.items():
@@ -93,9 +94,6 @@ class Rate(object):
             for j in  tmp.items():
                 d[j[0]] = j[1]
             self._cache.append(d)
-
-
-        # [self._cache.append(x) for x in data]
 
 
 @_time_log
@@ -154,7 +152,7 @@ def rates_saver(queue):
                 break
 
             except Exception as e:
-                logger.error("cann't save data: {0} .. retry after 3 sec..".format(data))
+                logger.debug("cann't save data: {0} .. retry after 3 sec..".format(data))
                 time.sleep(3)
 
                 continue
@@ -233,7 +231,7 @@ async def _execute(websocket, data):
         global rates
 
         cmd = data.get("action")
-        logger.info("cmd is {}".format(cmd))
+        logger.debug("cmd is {}".format(cmd))
 
         #
         # Assets handler
@@ -247,21 +245,13 @@ async def _execute(websocket, data):
                    }
 
             await websocket.send(json.dumps(res))
+
         #
         # Subscribe handler
         #
         elif cmd == "subscribe":
-            _id = data.get("message").get("assetId")
-            _name = R_LIST.get(_id)
 
-            if _name is None:
-               raise Exception("assetId: {0} is not avaliable".format(_id))
-
-            # send cache 5 min data
-            cache5 = [x.get(_name) for x in rates.get_cache()]
-            logger.info("len cache is {}".format(len(cache5)))
-            await websocket.send(json.dumps(cache5))
-
+            _name = await _push_cache(websocket, data)
             # send last
             _tmp = None
             while True:
@@ -270,24 +260,75 @@ async def _execute(websocket, data):
                 # TODO create pub/sub messaging throw registered client &
                 # observable class
                 #
+                data = rates.current().get(_name)
 
-                d = rates.current().get(_name)
-                if _tmp != d.get("time"):
-                    await websocket.send(json.dumps(d))
-                    _tmp = d.get("time")
+                listener_task = asyncio.ensure_future(websocket.recv())
+                producer_task = asyncio.ensure_future(_push_last(websocket, _tmp, data))
 
-                await asyncio.sleep(0.250)  # time delta beetwen diff clients
+                done, pending = await asyncio.wait([listener_task, producer_task],
+                                                    return_when=asyncio.FIRST_COMPLETED)
+
+                if producer_task in done:
+                    message = producer_task.result()
+
+                    if message == 1:
+                        break
+                    else:
+                        _tmp = message
+                else:
+                    producer_task.cancel()
+
+                if listener_task in done:
+                    message = json.loads(listener_task.result())
+                    if message.get("action") == "subscribe":
+                        _name = await _push_cache(websocket, message)
+
+                else:
+                    listener_task.cancel()
+
+
         #
         # anything handler
         #
         else:
-            raise Exception("assetId: {0} is not avaliable".format(_id))
+            raise Exception("asset is not avaliable")
+
+
+async def _push_last(websocket, _tmp, data):
+
+    try:
+        if _tmp != data.get("time"):
+            await websocket.send(json.dumps(data))
+            _tmp = data.get("time")
+
+        await asyncio.sleep(0.250)  # time delta beetwen diff clients
+
+    except Exception:
+        return 1
+
+    return _tmp
+
+async def _push_cache(websocket, data):
+
+    _id = data.get("message").get("assetId")
+    _name = R_LIST.get(_id)
+
+    if _name is None:
+        raise Exception("assetId: {0} is not avaliable".format(_id))
+
+    # send cache 5 min data
+    cache5 = [x.get(_name) for x in rates.get_cache()]
+    logger.debug("len cache is {}".format(len(cache5)))
+    await websocket.send(json.dumps(cache5))
+
+    return _name
 
 
 async def h_rate(websocket, path):
     """
     Handler for ws connections
     """
+
     while True:
 
         data = await websocket.recv()
@@ -321,8 +362,7 @@ def restore_rates(rates, size=300):
 
 
 #
-# TODO remove global reference!!!
-#      how pass reference to websocket??
+# TODO remove global reference
 #
 rates = Rate()
 
