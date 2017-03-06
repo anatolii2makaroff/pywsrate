@@ -10,11 +10,12 @@ import websockets
 from threading import Thread
 from queue import Queue
 from collections import deque
+import redis
 import requests
 import time
 from lxml import etree
+import json
 import logging
-
 
 #
 # config
@@ -31,6 +32,10 @@ R_LIST = {
 HOST = "localhost"
 PORT = 8080
 
+RHOST = "localhost"
+RPORT = 6379
+RDB = 0
+
 FX_URL = "http://rates.fxcm.com/RatesXML2"
 
 ######
@@ -38,34 +43,6 @@ FX_URL = "http://rates.fxcm.com/RatesXML2"
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(threadName)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
-
-class Rate(object):
-    """
-        Rate values struct
-        and L1 cache (default 300)
-    """
-    def __init__(self, cached_size=300):
-        self.data = {}
-        self._cache = deque([], cached_size)
-
-    def update(self, timestamp, data):
-        for i in data.items():
-            self.data[i[0]] = {"assetName": i[0],
-                               "time": timestamp,
-                               "assetId": [x[0] for x in R_LIST.items()
-                                            if x[1] == i[0]][0],
-                                "value": i[1]}
-
-        # add to cache
-        self._cache.append(self.data)
-
-
-    def current(self):
-        return self.data
-
-    def get_cache(self):
-        return self._cache
 
 
 def _time_log(f):
@@ -79,6 +56,47 @@ def _time_log(f):
         logger.debug("time elapsed: {} {} s.".format(f.__name__, time.time() - tb))
         return ret
     return wrap
+
+
+class Rate(object):
+    """
+        Rate values struct
+        and L1 cache (default 300)
+    """
+    def __init__(self, cached_size=300):
+        self.data = {}
+        self._cache = deque([], cached_size)
+    @_time_log
+    def update(self, timestamp, data):
+        for i in data.items():
+            self.data[i[0]] = {"assetName": i[0],
+                               "time": timestamp,
+                               "assetId": [x[0] for x in R_LIST.items()
+                                            if x[1] == i[0]][0],
+                                "value": i[1]}
+
+        # add to cache
+        self._cache.append(self.data)
+
+    def current(self):
+        return self.data
+
+    def get_cache(self):
+        return self._cache
+
+    @_time_log
+    def set_cache(self, data):
+        d = {}
+        for i in data:
+            tmp = json.loads(i)
+
+            for j in  tmp.items():
+                d[j[0]] = j[1]
+            self._cache.append(d)
+
+
+        # [self._cache.append(x) for x in data]
+
 
 @_time_log
 def parseXML(data):
@@ -118,16 +136,28 @@ def b_time():
 def rates_saver(queue):
     """
         data save consumer
-
     """
+    r = redis.StrictRedis(host=RHOST, port=RPORT, db=RDB)
+    _cap = 30 * 60  # 30 min capacity
 
     while True:
         data = queue.get()
+        data = json.dumps(data)  # convert to json
         logger.debug("get data: {0}".format(data))
 
-        # TODO save to redis..
+        # try to save
+        while True:
+            try:
+                r.lpush("p", data)
+                r.ltrim("p", 0, _cap - 1)
 
+                break
 
+            except Exception as e:
+                logger.error("cann't save data: {0} .. retry after 3 sec..".format(data))
+                time.sleep(3)
+
+                continue
 
 
 def rates_producer(rates, queue):
@@ -163,16 +193,21 @@ def rates_producer(rates, queue):
             # TODO: need catch only FX service err..
             logger.error(e)
             # try immedeatly 150 ms
-            # TODO: increasing interval value (if FX is not avaliable too long)
             time.sleep(0.150)
-            logger.info("try to reconnect..")
 
-            #
-            # if we'll make more trying - need save first time
-            # after we'll sleep less time
-            #
-            next(tbg)
-            _flag = False
+            if time.time() - tb > 0.7:
+                logger.warn("lost rate dot {0}..".format(tb))
+                next(tbg)
+                _flag = True
+
+            else:
+                logger.info("try to reconnect..")
+                #
+                # if we'll make more trying - need save first time
+                # after we'll sleep less time
+                #
+                next(tbg)
+                _flag = False
 
             continue
 
@@ -191,6 +226,64 @@ def _sleep1(delta):
         time.sleep(1.0 - delta)
 
 
+async def _execute(websocket, data):
+        """
+           Cmd handler
+        """
+        global rates
+
+        cmd = data.get("action")
+        logger.info("cmd is {}".format(cmd))
+
+        #
+        # Assets handler
+        #
+        if cmd == "assets":
+
+            res = {"action":"assets",
+                   "message":{
+                       "assets": [{"id":x[0], "name":  x[1]} for x in R_LIST.items()]
+                    }
+                   }
+
+            await websocket.send(json.dumps(res))
+        #
+        # Subscribe handler
+        #
+        elif cmd == "subscribe":
+            _id = data.get("message").get("assetId")
+            _name = R_LIST.get(_id)
+
+            if _name is None:
+               raise Exception("assetId: {0} is not avaliable".format(_id))
+
+            # send cache 5 min data
+            cache5 = [x.get(_name) for x in rates.get_cache()]
+            logger.info("len cache is {}".format(len(cache5)))
+            await websocket.send(json.dumps(cache5))
+
+            # send last
+            _tmp = None
+            while True:
+                #
+                # long pooling
+                # TODO create pub/sub messaging throw registered client &
+                # observable class
+                #
+
+                d = rates.current().get(_name)
+                if _tmp != d.get("time"):
+                    await websocket.send(json.dumps(d))
+                    _tmp = d.get("time")
+
+                await asyncio.sleep(0.250)  # time delta beetwen diff clients
+        #
+        # anything handler
+        #
+        else:
+            raise Exception("assetId: {0} is not avaliable".format(_id))
+
+
 async def h_rate(websocket, path):
     """
     Handler for ws connections
@@ -198,30 +291,46 @@ async def h_rate(websocket, path):
     while True:
 
         data = await websocket.recv()
-        logger.debug("recv {}".format(data))
 
-        cmd = data.get("action")
-        logger.debug("cmd is {}".format(cmd))
+        try:
+            data = json.loads(data)
+            logger.debug("recv {}".format(data))
+            await _execute(websocket, data)
 
-        if cmd == "assets":
-            pass
-        elif cmd == "subscribe":
-            while True:
+        except Exception as e:
+            logger.error("cmd: {}".format(e))
+            await websocket.send(json.dumps({"error": "cmd: {}".format(e)}))
 
-                await asyncio.sleep(1.0)
+        continue
 
 
-        else:
-            logger.warn("unknow cmd: {}".format(cmd))
-            await websocket.send("unknow cmd: {}".format(cmd))
+@_time_log
+def restore_rates(rates, size=300):
+    """
+    restore 5 min cache from redis
+    """
+    try:
+        r = redis.StrictRedis(host=RHOST, port=RPORT, db=RDB, decode_responses=True)
+        data = r.lrange("p", 0, size - 1)
 
+        logger.debug("reading from cache from redis: {0}".format(len(data)))
+        rates.set_cache(data)
+
+    except Exception as e:
+        logger.warn("error when restore from redis: {0}".format(e))
+
+
+#
+# TODO remove global reference!!!
+#      how pass reference to websocket??
+#
+rates = Rate()
 
 def main():
 
-    #
-    # TODO when starts -> fill rates from store
-    #
-    rates = Rate()
+    global rates
+
+    restore_rates(rates)
 
     queue = Queue(600)  # 10 min capacity
 
@@ -244,7 +353,7 @@ def main():
     t2.start()
 
     #
-    # start event loop for websocket requests
+    # start event loop in main thread for websocket requests
     # rates comes from publisher
     #
 
