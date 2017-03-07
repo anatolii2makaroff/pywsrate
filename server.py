@@ -16,7 +16,7 @@ import time
 from lxml import etree
 import json
 import logging
-
+import threading
 #
 # config
 #
@@ -159,7 +159,7 @@ def rates_saver(queue):
                 continue
 
 
-def rates_producer(rates, queue):
+def rates_producer(rates, queue, ev):
 
     s = requests.Session()
     _flag = True
@@ -171,6 +171,7 @@ def rates_producer(rates, queue):
         tb = tbg.send(_flag)
         logger.debug("begin time is {}".format(tb))
         try:
+
             res = s.get(FX_URL, timeout=0.3)
             if res.status_code != 200:
                 raise Exception(res.text)
@@ -180,6 +181,8 @@ def rates_producer(rates, queue):
 
             rates.update(tb, rate)
             logger.debug("rate's data: {0}".format(rates.current()))
+
+            ev.set()
 
             if not queue.full():
                 logger.debug("queue size is {0}".format(queue.qsize()))
@@ -230,6 +233,7 @@ async def _execute(websocket, data):
            Cmd handler
         """
         global rates
+        global ev
 
         cmd = data.get("action")
         logger.debug("cmd is {}".format(cmd))
@@ -254,17 +258,19 @@ async def _execute(websocket, data):
 
             _name = await _push_cache(websocket, data)
             # send last
-            _tmp = None
             while True:
                 #
                 # long pooling
                 # TODO create pub/sub messaging throw registered client &
                 # observable class
                 #
+                await ev.wait()
+                ev.clear()
+
                 data = rates.current().get(_name)
 
                 listener_task = asyncio.ensure_future(websocket.recv())
-                producer_task = asyncio.ensure_future(_push_last(websocket, _tmp, data))
+                producer_task = asyncio.ensure_future(_push_last(websocket, data))
 
                 done, pending = await asyncio.wait([listener_task, producer_task],
                                                     return_when=asyncio.FIRST_COMPLETED)
@@ -274,8 +280,6 @@ async def _execute(websocket, data):
 
                     if message == 1:
                         break
-                    else:
-                        _tmp = message
                 else:
                     producer_task.cancel()
 
@@ -295,19 +299,14 @@ async def _execute(websocket, data):
             raise Exception("asset is not avaliable")
 
 
-async def _push_last(websocket, _tmp, data):
+async def _push_last(websocket, data):
 
     try:
-        if _tmp != data.get("time"):
-            await websocket.send(json.dumps(data))
-            _tmp = data.get("time")
-
-        await asyncio.sleep(0.3)  # time delta beetwen diff clients
-
+        await websocket.send(json.dumps(data))
     except Exception:
         return 1
 
-    return _tmp
+    return 0
 
 async def _push_cache(websocket, data):
 
@@ -373,9 +372,16 @@ def restore_rates(rates, size=300):
 rates = Rate()
 registered = set()
 
+class Event_(asyncio.Event):
+        def set(self):
+            self._loop.call_soon_threadsafe(super().set)
+
+ev = Event_()
+
 def main():
 
     global rates
+    global ev
 
     restore_rates(rates)
 
@@ -385,7 +391,7 @@ def main():
     # start producer for rates
     # it pull, write & publish
     #
-    t = Thread(target=rates_producer, args=(rates, queue))
+    t = Thread(target=rates_producer, args=(rates, queue, ev))
 
     #
     # start consumer for rates
