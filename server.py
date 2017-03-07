@@ -69,6 +69,7 @@ class Rate(object):
 
     @_time_log
     def update(self, timestamp, data):
+        self.data = {}
         for i in data.items():
             self.data[i[0]] = {"assetName": i[0],
                                "time": timestamp,
@@ -301,7 +302,7 @@ async def _push_last(websocket, _tmp, data):
             await websocket.send(json.dumps(data))
             _tmp = data.get("time")
 
-        await asyncio.sleep(0.250)  # time delta beetwen diff clients
+        await asyncio.sleep(0.3)  # time delta beetwen diff clients
 
     except Exception:
         return 1
@@ -328,21 +329,26 @@ async def h_rate(websocket, path):
     """
     Handler for ws connections
     """
+    global registered
 
-    while True:
+    registered.add(websocket)
+    logger.info("connected users: {0}".format(len(registered)))
 
-        data = await websocket.recv()
+    try:
 
-        try:
+        while True:
+
+            data = await websocket.recv()
+
             data = json.loads(data)
             logger.debug("recv {}".format(data))
             await _execute(websocket, data)
 
-        except Exception as e:
-            logger.error("cmd: {}".format(e))
-            await websocket.send(json.dumps({"error": "cmd: {}".format(e)}))
+            continue
 
-        continue
+    finally:
+        registered.remove(websocket)
+        logger.info("connected users: {0}".format(len(registered)))
 
 
 @_time_log
@@ -365,6 +371,7 @@ def restore_rates(rates, size=300):
 # TODO remove global reference
 #
 rates = Rate()
+registered = set()
 
 def main():
 
